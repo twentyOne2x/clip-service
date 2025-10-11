@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import os
+import secrets
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Literal, Optional, Tuple
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from google.cloud import storage
 from pydantic import BaseModel, Field, HttpUrl, validator
@@ -119,6 +120,7 @@ config = ClipServiceConfig(
     sample_stream_url=os.getenv('CLIP_SAMPLE_STREAM_URL'),
     ffmpegCopyCodec=os.getenv('CLIP_FFMPEG_COPY_CODEC', 'false').lower() == 'true',
 )
+AUTH_TOKEN = os.getenv('CLIP_SERVICE_AUTH_TOKEN') or os.getenv('CLIP_SERVICE_TOKEN')
 store = ClipJobStore()
 storage_client: Optional[storage.Client] = None
 
@@ -262,13 +264,27 @@ async def process_job(job: Job) -> None:
     await run_ffmpeg_clip(job)
 
 
+def verify_auth_header(authorization: str = Header(default='')) -> None:
+    if not AUTH_TOKEN:
+        return
+    if not authorization or not authorization.startswith('Bearer '):
+        raise HTTPException(status_code=401, detail='Missing bearer token')
+    token = authorization[7:].strip()
+    if not token or not secrets.compare_digest(token, AUTH_TOKEN):
+        raise HTTPException(status_code=401, detail='Invalid bearer token')
+
+
 @app.get('/healthz')
 async def healthcheck() -> Dict[str, bool]:
     return {'status': True, 'dry_run': config.dry_run}
 
 
 @app.post('/clips', response_model=ClipResponse)
-async def create_clip(request: ClipRequest, background_tasks: BackgroundTasks) -> ClipResponse:
+async def create_clip(
+    request: ClipRequest,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(verify_auth_header),
+) -> ClipResponse:
     existing = store.find_existing(request)
     if existing:
         return existing.to_response()
@@ -281,7 +297,7 @@ async def create_clip(request: ClipRequest, background_tasks: BackgroundTasks) -
 
 
 @app.get('/clips/{clip_id}', response_model=ClipResponse)
-async def get_clip(clip_id: str) -> ClipResponse:
+async def get_clip(clip_id: str, _: None = Depends(verify_auth_header)) -> ClipResponse:
     job = store.get(clip_id)
     if not job:
         raise HTTPException(status_code=404, detail='Clip not found')
@@ -289,7 +305,11 @@ async def get_clip(clip_id: str) -> ClipResponse:
 
 
 @app.get('/clips/{clip_id}/file')
-async def serve_clip_file(clip_id: str, download: bool = Query(False)) -> FileResponse:
+async def serve_clip_file(
+    clip_id: str,
+    download: bool = Query(False),
+    _: None = Depends(verify_auth_header),
+) -> FileResponse:
     job = store.get(clip_id)
     if not job or job.status != 'ready' or not job.output_path or not job.output_path.exists():
         raise HTTPException(status_code=404, detail='Clip not available')

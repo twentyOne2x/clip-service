@@ -35,6 +35,7 @@ docker run --rm -p 8080:8080 hq-clip-service
 | `CLIP_OUTPUT_DIRECTORY` | `/tmp/clip-service/output` | Directory where generated clips are written when dry-run is disabled. |
 | `CLIP_SAMPLE_STREAM_URL` | sample MP4 URL | URL returned during dry-run to emulate a playable clip. |
 | `CLIP_FFMPEG_COPY_CODEC` | `false` | When `true`, the worker attempts `-c copy` to avoid re-encoding. |
+| `CLIP_SERVICE_AUTH_TOKEN` | — | Optional bearer token required on every request (`Authorization: Bearer …`). If unset, the service runs in open mode. You can also reuse `CLIP_SERVICE_TOKEN` to share a value with the Next.js proxy. |
 
 ### Source handling
 
