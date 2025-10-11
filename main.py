@@ -6,14 +6,20 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Literal, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
-from google.cloud import storage
+try:
+    from google.cloud import storage  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency for GCS downloads
+    storage = None  # type: ignore
 from pydantic import BaseModel, Field, HttpUrl, validator
-from yt_dlp import YoutubeDL
+try:
+    from yt_dlp import YoutubeDL  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency for web downloads
+    YoutubeDL = None  # type: ignore
 
 
 ClipStatus = Literal['queued', 'processing', 'ready', 'error']
@@ -122,7 +128,7 @@ config = ClipServiceConfig(
 )
 AUTH_TOKEN = os.getenv('CLIP_SERVICE_AUTH_TOKEN') or os.getenv('CLIP_SERVICE_TOKEN')
 store = ClipJobStore()
-storage_client: Optional[storage.Client] = None
+storage_client: Optional[Any] = None
 
 app = FastAPI(title='HQ Clip Service', version='0.2.0')
 
@@ -147,6 +153,8 @@ def parse_gs_uri(uri: str) -> Tuple[str, str]:
 
 
 def download_from_gcs(uri: str, workdir: Path) -> Path:
+    if storage is None:
+        raise RuntimeError('google-cloud-storage is required to fetch gs:// URIs')
     global storage_client  # pylint: disable=global-statement
     bucket_name, object_name = parse_gs_uri(uri)
     if storage_client is None:
@@ -159,6 +167,8 @@ def download_from_gcs(uri: str, workdir: Path) -> Path:
 
 
 def download_with_ytdlp(url: str, workdir: Path) -> Path:
+    if YoutubeDL is None:
+        raise RuntimeError('yt-dlp is required to download non-GCS sources')
     output_template = str(workdir / 'source.%(ext)s')
     ydl_opts = {
         'quiet': True,
