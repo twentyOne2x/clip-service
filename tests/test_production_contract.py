@@ -135,6 +135,58 @@ def test_production_headers_media_access_and_idempotency_are_tenant_scoped(monke
     assert arbitrary_url.status_code == 400
 
 
+def test_terminal_clip_retry_is_tenant_scoped_idempotent_and_reuses_exact_payload(monkeypatch, tmp_path):
+    repository = configure_test_runtime(monkeypatch, tmp_path, production=True)
+    source = tmp_path / 'media' / 'source.mp4'
+    source.write_bytes(b'canonical-video-bytes')
+    repository.register_media(
+        MediaRecord('media-1', str(source.resolve()), hashlib.sha256(source.read_bytes()).hexdigest(), True),
+        [TENANT_A],
+    )
+    payload = {
+        'mediaId': 'media-1', 'start': 0, 'end': 1,
+        'contextMode': 'seconds', 'padBefore': 0, 'padAfter': 0,
+    }
+    client = TestClient(main.app)
+    created = client.post(
+        '/clips', headers={**identity_headers(), 'Idempotency-Key': 'create-clip'}, json=payload,
+    )
+    clip_id = created.json()['clipId']
+    claimed = repository.claim(clip_id, 'worker-a', 30)
+    assert claimed is not None
+    repository.mark_failure(
+        clip_id,
+        'worker-a',
+        error_code='render_failed',
+        error_message='bounded failure',
+        retryable=False,
+        retry_delay_seconds=0,
+    )
+
+    missing_key = client.post(f'/clips/{clip_id}/retry', headers=identity_headers())
+    assert missing_key.status_code == 400
+    assert client.post(
+        f'/clips/{clip_id}/retry',
+        headers={**identity_headers(TENANT_B), 'Idempotency-Key': 'retry-1'},
+    ).status_code == 404
+
+    retried = client.post(
+        f'/clips/{clip_id}/retry',
+        headers={**identity_headers(), 'Idempotency-Key': 'retry-1'},
+    )
+    assert retried.status_code == 200
+    assert retried.json()['generation'] == 1
+    assert retried.json()['requestPayload'] == created.json()['requestPayload']
+    retried_id = retried.json()['clipId']
+
+    duplicate = client.post(
+        f'/clips/{clip_id}/retry',
+        headers={**identity_headers(), 'Idempotency-Key': 'retry-1'},
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()['clipId'] == retried_id
+
+
 def test_legacy_batch_ids_cannot_cross_tenants(monkeypatch, tmp_path):
     configure_test_runtime(monkeypatch, tmp_path, production=False)
     client = TestClient(main.app)

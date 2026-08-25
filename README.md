@@ -5,6 +5,7 @@ The service renders bounded, high-quality MP4 clips from canonical media. Postgr
 Primary endpoints:
 
 - `POST /clips` – queue a high-resolution clip job (deduplicated by payload hash)
+- `POST /clips/{id}/retry` – create one idempotent new generation from a terminal error/expired job
 - `GET /clips/{id}` – poll for job status/URLs
 - `GET /clips/{id}/file` – stream or download the generated clip (`?download=1` forces attachment)
 - `POST /internal/media` – local-development media fixture endpoint (disabled and hidden in production)
@@ -53,7 +54,7 @@ The image runs as uid/gid `10001`, pins the Python base-image manifest and Deno 
 | `CLIP_MAX_CLIP_SECONDS` | `600` | Maximum requested clip duration, hard-capped at 1800 seconds. |
 | `CLIP_MAX_PADDING_SECONDS` | `30` | Maximum padding on either side. |
 | `CLIP_MAX_ARTIFACT_BYTES` | `2147483648` | Maximum published MP4 size. |
-| `CLIP_AUTO_MIGRATE` | `true` | Apply the idempotent `migrations/001_clip_jobs.sql` schema at startup. |
+| `CLIP_AUTO_MIGRATE` | `true` | Apply every ordered idempotent SQL migration under `migrations/` at startup. |
 
 The ingestion Alembic migration `20260825_0002_tenant_exports_canonical_media` must run before clip traffic because it owns the shared canonical-media and entitlement tables. A separate clip migration service is not required while `CLIP_AUTO_MIGRATE=true`. Deployments using a least-privileged runtime role can instead run the following one-shot command with a DDL role, then set `CLIP_AUTO_MIGRATE=false` for the service:
 
@@ -71,7 +72,9 @@ The public app authenticates the caller and must strip any client-supplied inter
 
 The clip service never derives tenancy from request payloads. Production rejects legacy ids, uppercase hashes, and swapped `usr_`/`ten_` prefixes. Create, status, file, batch, and retry lookups are scoped by the forwarded tenant. Development retains the historical bearer-token path, accepts its legacy broad ids, and uses `local` tenant/user defaults when identity headers are absent.
 
-`POST /clips` accepts `Idempotency-Key`. Reuse by the same tenant/user with different normalized clip parameters returns HTTP 409. Identical normalized requests deduplicate within a tenant.
+`POST /clips` accepts `Idempotency-Key`. Reuse by the same tenant/user with different normalized clip parameters returns HTTP 409. Identical normalized requests deduplicate within a tenant. `POST /clips/{id}/retry` requires a new `Idempotency-Key` and is allowed only when the tenant-owned source job is `error` or `expired`. It copies the exact persisted request into the next numeric generation. Repeated keys and concurrent distinct retry intents converge on the same queued/processing/ready generation, preventing duplicate rendering effects.
+
+`migrations/002_clip_job_generations_rls.sql` forces PostgreSQL row-level security on clip jobs, retry aliases, and artifacts. The API transaction sets `app.tenant_id` before every tenant read or write. Production runs the HTTP API as fixed `icmfyi_clip_api` with a read-only artifact mount and runs the sole renderer/retention loop as fixed `icmfyi_clip_worker` with the writable artifact mount. Both roles are non-owner, `NOBYPASSRLS`; only the worker policy can claim across tenants.
 
 ## Canonical media and rendering
 

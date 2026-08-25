@@ -8,6 +8,7 @@
 - `persistence.py` provides the shared repository contract plus PostgreSQL and local in-memory implementations.
 - Ingestion migration `20260825_0002_tenant_exports_canonical_media` owns canonical media, hot-local locations, and tenant/channel entitlements.
 - `migrations/001_clip_jobs.sql` defines leased clip jobs, idempotency aliases, and published artifacts without duplicating ingestion ownership.
+- `migrations/002_clip_job_generations_rls.sql` adds retry generations and forced tenant RLS with a fixed cross-tenant worker role.
 - Docker runtime packages ffmpeg/yt-dlp execution path for non-dry-run mode.
 - PostgreSQL is mandatory in production. In-memory persistence is a development/test adapter only.
 
@@ -21,6 +22,7 @@
 7. The active lease holder commits artifact metadata and the ready transition in one database transaction.
 8. Status and file reads filter by tenant and return 404 across tenant boundaries; file reads support a single bounded byte range.
 9. Optional retention atomically expires database state before safely unlinking files confined to the artifact root.
+10. A terminal error/expired job may be regenerated with a new idempotency key; concurrent retry requests lock the request family and converge on one next generation.
 
 ## Ops Notes
 - Production requires the internal gateway headers and a secret of at least 32 characters.
@@ -30,4 +32,5 @@
 - Cancellation and timeout terminate the complete ffmpeg/ffprobe process group. A stale worker cannot publish through an expired lease.
 - Retention is disabled by default. Enabled sweeps are metadata-first and path-confined, so interruption can only leave an unreferenced artifact for later cleanup.
 - The output volume is writable by uid/gid 10001; canonical media mounts should be read-only.
+- The API and renderer use separate database roles and containers. Only the renderer receives a writable output mount and the fixed worker role authorized by the RLS policy.
 - Use `scripts/knowledge_check.py` to validate repository knowledge-base hygiene.

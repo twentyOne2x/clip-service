@@ -49,6 +49,10 @@ class LeaseLost(PersistenceError):
     """A worker attempted to publish after losing its lease."""
 
 
+class RetryNotAllowed(PersistenceError):
+    """A caller requested a new generation from a non-terminal clip."""
+
+
 @dataclass(frozen=True)
 class MediaRecord:
     media_id: str
@@ -68,6 +72,7 @@ class JobRecord:
     payload: Dict[str, Any]
     render_profile: str
     status: str
+    generation: int = 0
     attempt_count: int = 0
     max_attempts: int = 3
     available_at: datetime = field(default_factory=utcnow)
@@ -93,6 +98,14 @@ class Repository(Protocol):
     def register_media(self, media: MediaRecord, tenant_ids: Iterable[str]) -> None: ...
     def resolve_media(self, tenant_id: str, media_id: str) -> MediaRecord: ...
     def create_or_get(self, record: JobRecord) -> Tuple[JobRecord, bool]: ...
+    def retry_terminal(
+        self,
+        job_id: str,
+        tenant_id: str,
+        requested_by_user_id: str,
+        idempotency_key: str,
+        new_job_id: str,
+    ) -> Tuple[JobRecord, bool]: ...
     def get_for_tenant(self, job_id: str, tenant_id: str) -> Optional[JobRecord]: ...
     def claim(self, job_id: str, owner: str, lease_seconds: int) -> Optional[JobRecord]: ...
     def claim_next(self, owner: str, lease_seconds: int) -> Optional[JobRecord]: ...
@@ -130,7 +143,7 @@ class MemoryRepository:
         self._media: Dict[str, MediaRecord] = {}
         self._media_access: set[tuple[str, str]] = set()
         self._jobs: Dict[str, JobRecord] = {}
-        self._request_index: Dict[tuple[str, str], str] = {}
+        self._request_index: Dict[tuple[str, str, int], str] = {}
         self._idempotency_index: Dict[tuple[str, str, str], str] = {}
         self._artifacts: Dict[str, Dict[str, Any]] = {}
 
@@ -165,7 +178,7 @@ class MemoryRepository:
                     if existing.request_hash != record.request_hash:
                         raise IdempotencyConflict("idempotency key was reused with a different request")
                     return existing, False
-            request_key = (record.tenant_id, record.request_hash)
+            request_key = (record.tenant_id, record.request_hash, record.generation)
             existing_id = self._request_index.get(request_key)
             if existing_id:
                 if record.idempotency_key:
@@ -180,6 +193,65 @@ class MemoryRepository:
                     (record.tenant_id, record.requested_by_user_id, record.idempotency_key)
                 ] = record.id
             return record, True
+
+    def retry_terminal(
+        self,
+        job_id: str,
+        tenant_id: str,
+        requested_by_user_id: str,
+        idempotency_key: str,
+        new_job_id: str,
+    ) -> Tuple[JobRecord, bool]:
+        with self._lock:
+            key = (tenant_id, requested_by_user_id, idempotency_key)
+            existing_id = self._idempotency_index.get(key)
+            if existing_id:
+                existing = self._jobs[existing_id]
+                source = self._jobs.get(job_id)
+                if source is None or existing.request_hash != source.request_hash:
+                    raise IdempotencyConflict("idempotency key was reused with a different request")
+                return existing, False
+            source = self._jobs.get(job_id)
+            if source is None or source.tenant_id != tenant_id:
+                raise MediaNotFound("clip job is unavailable for this tenant")
+            family = sorted(
+                (
+                    row for row in self._jobs.values()
+                    if row.tenant_id == tenant_id and row.request_hash == source.request_hash
+                ),
+                key=lambda row: (row.generation, row.created_at, row.id),
+            )
+            latest = family[-1]
+            if latest.id == source.id and source.status not in {"error", "expired"}:
+                raise RetryNotAllowed("only terminal error or expired clips can be retried")
+            if latest.status in {"queued", "processing", "ready"}:
+                self._idempotency_index[key] = latest.id
+                return latest, False
+            if source.status not in {"error", "expired"}:
+                raise RetryNotAllowed("only terminal error or expired clips can be retried")
+            retried = replace(
+                source,
+                id=new_job_id,
+                requested_by_user_id=requested_by_user_id,
+                idempotency_key=idempotency_key,
+                status="queued",
+                generation=latest.generation + 1,
+                attempt_count=0,
+                available_at=utcnow(),
+                lease_owner=None,
+                lease_until=None,
+                stream_url=None,
+                download_url=None,
+                output_path=None,
+                error_code=None,
+                error_message=None,
+                created_at=utcnow(),
+                updated_at=utcnow(),
+            )
+            self._jobs[retried.id] = retried
+            self._request_index[(tenant_id, retried.request_hash, retried.generation)] = retried.id
+            self._idempotency_index[key] = retried.id
+            return retried, True
 
     def get_for_tenant(self, job_id: str, tenant_id: str) -> Optional[JobRecord]:
         with self._lock:
@@ -372,6 +444,7 @@ def _record_from_row(row: Dict[str, Any]) -> JobRecord:
         payload=dict(payload),
         render_profile=row["render_profile"],
         status=row["status"],
+        generation=int(row.get("generation", 0)),
         attempt_count=int(row["attempt_count"]),
         max_attempts=int(row["max_attempts"]),
         available_at=row["available_at"],
@@ -400,9 +473,22 @@ class PostgresRepository:
         return psycopg.connect(self.database_url, row_factory=dict_row)
 
     def ensure_schema(self) -> None:
-        sql = self.migration_path.read_text(encoding="utf-8")
         with self._connect() as connection:
-            connection.execute(sql)
+            paths = [self.migration_path]
+            paths.extend(
+                path
+                for path in sorted(self.migration_path.parent.glob("*.sql"))
+                if path != self.migration_path
+            )
+            for path in paths:
+                connection.execute(path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _set_tenant(connection: Any, tenant_id: str) -> None:
+        connection.execute(
+            "SELECT set_config('app.tenant_id', %s, true)",
+            (tenant_id,),
+        )
 
     def register_media(self, media: MediaRecord, tenant_ids: Iterable[str]) -> None:
         del media, tenant_ids
@@ -412,10 +498,7 @@ class PostgresRepository:
 
     def resolve_media(self, tenant_id: str, media_id: str) -> MediaRecord:
         with self._connect() as connection:
-            connection.execute(
-                "SELECT set_config('app.tenant_id', %s, true)",
-                (tenant_id,),
-            )
+            self._set_tenant(connection, tenant_id)
             row = connection.execute(
                 """
                 SELECT
@@ -460,6 +543,7 @@ class PostgresRepository:
 
     def create_or_get(self, record: JobRecord) -> Tuple[JobRecord, bool]:
         with self._connect() as connection:
+            self._set_tenant(connection, record.tenant_id)
             if record.idempotency_key:
                 existing = connection.execute(
                     """
@@ -479,8 +563,8 @@ class PostgresRepository:
                 """
                 INSERT INTO clip_jobs (
                     id, tenant_id, requested_by_user_id, media_id, request_hash, idempotency_key, payload,
-                    render_profile, status, max_attempts, available_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, 'queued', %s, %s)
+                    render_profile, status, generation, max_attempts, available_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, 'queued', %s, %s, %s)
                 ON CONFLICT DO NOTHING
                 RETURNING *
                 """,
@@ -493,6 +577,7 @@ class PostgresRepository:
                     record.idempotency_key,
                     json.dumps(record.payload, sort_keys=True, separators=(",", ":")),
                     record.render_profile,
+                    record.generation,
                     record.max_attempts,
                     record.available_at,
                 ),
@@ -500,8 +585,12 @@ class PostgresRepository:
             created = row is not None
             if not row:
                 row = connection.execute(
-                    "SELECT * FROM clip_jobs WHERE tenant_id = %s AND request_hash = %s FOR UPDATE",
-                    (record.tenant_id, record.request_hash),
+                    """
+                    SELECT * FROM clip_jobs
+                    WHERE tenant_id = %s AND request_hash = %s AND generation = %s
+                    FOR UPDATE
+                    """,
+                    (record.tenant_id, record.request_hash, record.generation),
                 ).fetchone()
             if not row:
                 raise PersistenceError("clip job uniqueness conflict could not be reconciled")
@@ -537,8 +626,102 @@ class PostgresRepository:
                         raise PersistenceError("idempotency binding disagrees with canonical request dedupe")
             return _record_from_row(row), created
 
+    def retry_terminal(
+        self,
+        job_id: str,
+        tenant_id: str,
+        requested_by_user_id: str,
+        idempotency_key: str,
+        new_job_id: str,
+    ) -> Tuple[JobRecord, bool]:
+        with self._connect() as connection:
+            self._set_tenant(connection, tenant_id)
+            source = connection.execute(
+                "SELECT * FROM clip_jobs WHERE id = %s AND tenant_id = %s FOR UPDATE",
+                (job_id, tenant_id),
+            ).fetchone()
+            if not source:
+                raise MediaNotFound("clip job is unavailable for this tenant")
+            binding = connection.execute(
+                """
+                SELECT j.* FROM clip_job_idempotency AS i
+                JOIN clip_jobs AS j ON j.id = i.job_id AND j.tenant_id = i.tenant_id
+                WHERE i.tenant_id = %s AND i.requested_by_user_id = %s AND i.idempotency_key = %s
+                FOR UPDATE OF i
+                """,
+                (tenant_id, requested_by_user_id, idempotency_key),
+            ).fetchone()
+            if binding:
+                if binding["request_hash"] != source["request_hash"]:
+                    raise IdempotencyConflict("idempotency key was reused with a different request")
+                return _record_from_row(binding), False
+
+            family = connection.execute(
+                """
+                SELECT * FROM clip_jobs
+                WHERE tenant_id = %s AND request_hash = %s
+                ORDER BY generation DESC, created_at DESC, id DESC
+                FOR UPDATE
+                """,
+                (tenant_id, source["request_hash"]),
+            ).fetchall()
+            latest = family[0]
+            if latest["id"] == source["id"] and source["status"] not in {"error", "expired"}:
+                raise RetryNotAllowed("only terminal error or expired clips can be retried")
+            if latest["status"] in {"queued", "processing", "ready"}:
+                target = latest
+                created = False
+            else:
+                if source["status"] not in {"error", "expired"}:
+                    raise RetryNotAllowed("only terminal error or expired clips can be retried")
+                target = connection.execute(
+                    """
+                    INSERT INTO clip_jobs (
+                        id, tenant_id, requested_by_user_id, media_id, request_hash,
+                        idempotency_key, payload, render_profile, status, generation,
+                        max_attempts, available_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s::jsonb, %s, 'queued', %s, %s, NOW()
+                    )
+                    RETURNING *
+                    """,
+                    (
+                        new_job_id,
+                        tenant_id,
+                        requested_by_user_id,
+                        source["media_id"],
+                        source["request_hash"],
+                        idempotency_key,
+                        json.dumps(source["payload"], sort_keys=True, separators=(",", ":")),
+                        source["render_profile"],
+                        int(latest["generation"]) + 1,
+                        source["max_attempts"],
+                    ),
+                ).fetchone()
+                created = True
+            inserted = connection.execute(
+                """
+                INSERT INTO clip_job_idempotency (
+                    tenant_id, requested_by_user_id, idempotency_key, request_hash, job_id
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING job_id
+                """,
+                (
+                    tenant_id,
+                    requested_by_user_id,
+                    idempotency_key,
+                    source["request_hash"],
+                    target["id"],
+                ),
+            ).fetchone()
+            if not inserted:
+                raise PersistenceError("retry idempotency binding could not be committed")
+            return _record_from_row(target), created
+
     def get_for_tenant(self, job_id: str, tenant_id: str) -> Optional[JobRecord]:
         with self._connect() as connection:
+            self._set_tenant(connection, tenant_id)
             row = connection.execute(
                 "SELECT * FROM clip_jobs WHERE id = %s AND tenant_id = %s",
                 (job_id, tenant_id),

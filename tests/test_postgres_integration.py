@@ -2,6 +2,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
+import psycopg
 import pytest
 
 from persistence import (
@@ -181,3 +182,54 @@ def test_postgres_schema_tenant_dedupe_lease_and_atomic_artifact_contract():
             'SELECT 1 FROM clip_artifacts WHERE job_id = %s',
             (claimed.id,),
         ).fetchone() is None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        retries = list(pool.map(
+            lambda args: repository.retry_terminal(
+                claimed.id, TENANT_A, USER_A, args[0], args[1],
+            ),
+            [('retry-a', 'retry-job-a'), ('retry-b', 'retry-job-b')],
+        ))
+    assert sum(1 for _, created in retries if created) == 1
+    assert len({row.id for row, _ in retries}) == 1
+    retried = retries[0][0]
+    assert retried.generation == 1
+    assert retried.status == 'queued'
+    assert retried.payload == expired.payload
+
+    with repository._connect() as connection:  # pylint: disable=protected-access
+        connection.execute("DROP ROLE IF EXISTS icmfyi_clip_api")
+        connection.execute("DROP ROLE IF EXISTS icmfyi_clip_worker")
+        connection.execute("CREATE ROLE icmfyi_clip_api LOGIN PASSWORD 'api-test-password'")
+        connection.execute("CREATE ROLE icmfyi_clip_worker LOGIN PASSWORD 'worker-test-password'")
+        connection.execute("GRANT CONNECT ON DATABASE clip_test TO icmfyi_clip_api, icmfyi_clip_worker")
+        connection.execute("GRANT USAGE ON SCHEMA public TO icmfyi_clip_api, icmfyi_clip_worker")
+        connection.execute(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON clip_jobs, clip_job_idempotency, clip_artifacts "
+            "TO icmfyi_clip_api, icmfyi_clip_worker"
+        )
+
+    api_repository = PostgresRepository(
+        DATABASE_URL.replace('postgres:postgres', 'icmfyi_clip_api:api-test-password')
+    )
+    worker_repository = PostgresRepository(
+        DATABASE_URL.replace('postgres:postgres', 'icmfyi_clip_worker:worker-test-password')
+    )
+    assert api_repository.get_for_tenant(retried.id, TENANT_A) is not None
+    assert api_repository.get_for_tenant(retried.id, TENANT_B) is None
+    assert worker_repository.claim_next('worker-rls', 30) is not None
+
+    with api_repository._connect() as connection:  # pylint: disable=protected-access
+        assert connection.execute('SELECT COUNT(*) AS count FROM clip_jobs').fetchone()['count'] == 0
+        connection.execute("SELECT set_config('app.tenant_id', %s, true)", (TENANT_A,))
+        assert connection.execute('SELECT COUNT(*) AS count FROM clip_jobs').fetchone()['count'] >= 2
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                """
+                INSERT INTO clip_jobs (
+                    id, tenant_id, requested_by_user_id, request_hash, payload,
+                    render_profile, status
+                ) VALUES ('spoofed', %s, %s, %s, '{}'::jsonb, 'hq-1080p-v1', 'queued')
+                """,
+                (TENANT_B, USER_A, '9' * 64),
+            )

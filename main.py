@@ -38,6 +38,7 @@ from persistence import (
     MediaNotFound,
     MediaRecord,
     PersistenceError,
+    RetryNotAllowed,
     Repository,
     create_repository,
     new_job_record,
@@ -156,6 +157,7 @@ class ClipResponse(BaseModel):
     errorMessage: Optional[str] = None
     requestPayload: ClipRequest
     lastUpdated: datetime
+    generation: int = 0
 
 
 class MediaRegistrationRequest(BaseModel):
@@ -523,6 +525,7 @@ def persistent_record_response(record: JobRecord) -> ClipResponse:
         errorMessage=record.error_message,
         requestPayload=payload,
         lastUpdated=record.updated_at,
+        generation=record.generation,
     )
 
 
@@ -1826,6 +1829,39 @@ async def create_clip(
     try:
         persisted, created = await asyncio.to_thread(repository.create_or_get, record)
     except IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail='Clip persistence unavailable') from exc
+    if created:
+        if worker_wakeup is not None:
+            worker_wakeup.set()
+        if not config.production:
+            background_tasks.add_task(process_persistent_job, persisted.id)
+    return persistent_record_response(persisted)
+
+
+@app.post('/clips/{clip_id}/retry', response_model=ClipResponse)
+async def retry_clip(
+    clip_id: str,
+    background_tasks: BackgroundTasks,
+    idempotency_key: Optional[str] = Header(default=None, alias='Idempotency-Key'),
+    context: RequestContext = Depends(require_request_context),
+) -> ClipResponse:
+    key = validate_idempotency_key(idempotency_key)
+    if key is None:
+        raise HTTPException(status_code=400, detail='Idempotency-Key is required for clip retry')
+    try:
+        persisted, created = await asyncio.to_thread(
+            repository.retry_terminal,
+            clip_id,
+            context.tenant_id,
+            context.user_id,
+            key,
+            uuid4().hex,
+        )
+    except MediaNotFound as exc:
+        raise HTTPException(status_code=404, detail='Clip not found') from exc
+    except (IdempotencyConflict, RetryNotAllowed) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except PersistenceError as exc:
         raise HTTPException(status_code=503, detail='Clip persistence unavailable') from exc

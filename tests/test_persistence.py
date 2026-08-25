@@ -12,6 +12,7 @@ from persistence import (
     MediaRecord,
     MemoryRepository,
     PostgresRepository,
+    RetryNotAllowed,
 )
 
 
@@ -216,3 +217,49 @@ def test_retention_expires_ready_job_and_detaches_artifact_atomically():
     assert expired.error_code == 'artifact_expired'
     assert 'job-1' not in repository._artifacts  # pylint: disable=protected-access
     assert repository.expire_ready_before(datetime.now(timezone.utc), 100) == []
+
+
+def test_terminal_retry_creates_one_new_generation_and_duplicate_intents_converge():
+    repository = MemoryRepository()
+    repository.create_or_get(record(idempotency_key='create-1'))
+    claimed = repository.claim('job-1', 'worker-a', 30)
+    assert claimed is not None
+    failed = repository.mark_failure(
+        'job-1',
+        'worker-a',
+        error_code='render_failed',
+        error_message='bounded failure',
+        retryable=False,
+        retry_delay_seconds=0,
+    )
+    assert failed.status == 'error'
+
+    retried, created = repository.retry_terminal(
+        'job-1', 'tenant-a', 'user-a', 'retry-1', 'job-2',
+    )
+    assert created is True
+    assert retried.id == 'job-2'
+    assert retried.generation == 1
+    assert retried.payload == failed.payload
+
+    duplicate, created = repository.retry_terminal(
+        'job-1', 'tenant-a', 'user-a', 'retry-1', 'job-3',
+    )
+    assert created is False
+    assert duplicate.id == 'job-2'
+
+    concurrent_alias, created = repository.retry_terminal(
+        'job-1', 'tenant-a', 'user-a', 'retry-2', 'job-4',
+    )
+    assert created is False
+    assert concurrent_alias.id == 'job-2'
+    assert len(repository._jobs) == 2  # pylint: disable=protected-access
+
+
+def test_nonterminal_or_cross_tenant_retry_is_rejected():
+    repository = MemoryRepository()
+    repository.create_or_get(record())
+    with pytest.raises(RetryNotAllowed):
+        repository.retry_terminal('job-1', 'tenant-a', 'user-a', 'retry-1', 'job-2')
+    with pytest.raises(MediaNotFound):
+        repository.retry_terminal('job-1', 'tenant-b', 'user-b', 'retry-2', 'job-3')
