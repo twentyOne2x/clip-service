@@ -11,6 +11,7 @@ from persistence import (
     MediaNotFound,
     MediaRecord,
     MemoryRepository,
+    PostgresRepository,
 )
 
 
@@ -52,6 +53,41 @@ def test_canonical_media_is_immutable_and_tenant_scoped():
             MediaRecord('media-1', '/media/replaced.mp4', 'b' * 64, True),
             ['tenant-a'],
         )
+
+
+def test_postgres_media_resolver_sets_transaction_local_rls_scope_first(monkeypatch):
+    calls = []
+
+    class Result:
+        def fetchone(self):
+            return {
+                'media_id': 'media-1',
+                'source_path': '/media/source.mp4',
+                'source_sha256': 'a' * 64,
+                'video_capable': True,
+            }
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, params=None):
+            calls.append((' '.join(query.split()), params))
+            return Result()
+
+    repository = PostgresRepository('postgresql://runtime:secret@postgres/icmfyi')
+    monkeypatch.setattr(repository, '_connect', lambda: Connection())
+
+    media = repository.resolve_media('ten_' + 'b' * 64, 'media-1')
+
+    assert "set_config('app.tenant_id'" in calls[0][0]
+    assert calls[0][1] == ('ten_' + 'b' * 64,)
+    assert 'tenant_channel_entitlements' in calls[1][0]
+    assert calls[1][1] == ('ten_' + 'b' * 64, 'media-1')
+    assert media.media_id == 'media-1'
 
 
 def test_idempotency_conflict_is_user_scoped_while_request_dedupe_is_tenant_scoped():

@@ -412,6 +412,10 @@ class PostgresRepository:
 
     def resolve_media(self, tenant_id: str, media_id: str) -> MediaRecord:
         with self._connect() as connection:
+            connection.execute(
+                "SELECT set_config('app.tenant_id', %s, true)",
+                (tenant_id,),
+            )
             row = connection.execute(
                 """
                 SELECT
