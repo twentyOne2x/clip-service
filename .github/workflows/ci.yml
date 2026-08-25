@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16.12-bookworm@sha256:31424d3261c4ba75df1fca72d44f6842b66ce4ec76c1a4685f7a7219f6ec8924
+        env:
+          POSTGRES_DB: clip_test
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d clip_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CLIP_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/clip_test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-ci.txt
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements-ci.txt
+
+      - name: Compile sources (syntax check)
+        run: python -m py_compile main.py persistence.py
+
+      - name: Run tenant regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_persistence.py::test_postgres_media_resolver_sets_transaction_local_rls_scope_first \
+            tests/test_production_contract.py::test_production_headers_media_access_and_idempotency_are_tenant_scoped
+
+      - name: Run complete suite
+        run: python -m pytest -q tests
+
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Build application image
+        run: docker build --file Dockerfile --tag clip-service:ci .
+
+      - name: Verify non-root runtime user
+        run: test "$(docker image inspect --format '{{.Config.User}}' clip-service:ci)" = "10001:10001"

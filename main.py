@@ -1,41 +1,102 @@
 import asyncio
+import contextlib
 import hashlib
+import json
+import math
 import os
 import re
 import secrets
+import signal
 import tempfile
 import time
 import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request as UrlRequest, urlopen
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse, StreamingResponse
 try:
     from google.cloud import storage  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency for GCS downloads
     storage = None  # type: ignore
-from pydantic import BaseModel, Field, HttpUrl, validator
+from pydantic import BaseModel, Field, HttpUrl, root_validator, validator
 try:
     from yt_dlp import YoutubeDL  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency for web downloads
     YoutubeDL = None  # type: ignore
 
+from persistence import (
+    IdempotencyConflict,
+    JobRecord,
+    LeaseLost,
+    MediaConflict,
+    MediaNotFound,
+    MediaRecord,
+    PersistenceError,
+    RetryNotAllowed,
+    Repository,
+    create_repository,
+    new_job_record,
+)
 
-ClipStatus = Literal['queued', 'processing', 'ready', 'error']
+
+ClipStatus = Literal['queued', 'processing', 'ready', 'error', 'expired']
 ContextMode = Literal['seconds', 'sentence']
+RenderProfile = Literal['hq-1080p-v1']
+
+TENANT_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')
+USER_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,191}$')
+PRODUCTION_TENANT_ID_RE = re.compile(r'^ten_[0-9a-f]{64}$')
+PRODUCTION_USER_ID_RE = re.compile(r'^usr_[0-9a-f]{64}$')
+MEDIA_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$')
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = (os.getenv(name) or '').strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return min(maximum, max(minimum, value))
+
+
+def is_production_environment() -> bool:
+    return (os.getenv('CLIP_SERVICE_ENV') or os.getenv('ICMFYI_ENV') or '').strip().lower() in {
+        'prod',
+        'production',
+    }
+
+
+def max_clip_seconds() -> int:
+    return _env_int('CLIP_MAX_CLIP_SECONDS', 600, minimum=1, maximum=1800)
+
+
+def max_padding_seconds() -> int:
+    return _env_int('CLIP_MAX_PADDING_SECONDS', 30, minimum=0, maximum=120)
+
+
+def max_source_position_seconds() -> int:
+    return _env_int('CLIP_MAX_SOURCE_POSITION_SECONDS', 43200, minimum=60, maximum=604800)
 
 
 class ClipRequest(BaseModel):
+    mediaId: Optional[str] = Field(None, alias='mediaId', min_length=1, max_length=192)
     sourceUrl: Optional[HttpUrl] = Field(None, alias='sourceUrl')
-    parentTitle: Optional[str]
-    clipLabel: Optional[str]
-    channel: Optional[str]
+    parentTitle: Optional[str] = Field(None, max_length=500)
+    clipLabel: Optional[str] = Field(None, max_length=500)
+    channel: Optional[str] = Field(None, max_length=256)
     # If true, clip from real video (frames) instead of local mirrored audio (thumbnail-backed MP4).
     preferVideo: bool = Field(default=False, alias='preferVideo')
     start: float = Field(..., ge=0)
@@ -43,13 +104,46 @@ class ClipRequest(BaseModel):
     contextMode: ContextMode = Field(..., alias='contextMode')
     padBefore: float = Field(..., ge=0, alias='padBefore')
     padAfter: float = Field(..., ge=0, alias='padAfter')
+    renderProfile: RenderProfile = Field(default='hq-1080p-v1', alias='renderProfile')
 
-    @validator('end')
+    @validator('end', allow_reuse=True)
     def validate_end(cls, value: float, values: Dict[str, float]) -> float:  # pylint: disable=no-self-argument
         start = values.get('start')
         if start is not None and value <= start:
             raise ValueError('end must be greater than start')
         return value
+
+    @validator('mediaId', allow_reuse=True)
+    def validate_media_id(cls, value: Optional[str]) -> Optional[str]:  # pylint: disable=no-self-argument
+        if value is not None and not MEDIA_ID_RE.fullmatch(value):
+            raise ValueError('mediaId has invalid characters')
+        return value
+
+    @root_validator(allow_reuse=True)
+    def validate_render_bounds(cls, values: Dict[str, Any]) -> Dict[str, Any]:  # pylint: disable=no-self-argument
+        start = values.get('start')
+        end = values.get('end')
+        pad_before = values.get('padBefore')
+        pad_after = values.get('padAfter')
+        numbers = [value for value in (start, end, pad_before, pad_after) if value is not None]
+        if any(not math.isfinite(float(value)) for value in numbers):
+            raise ValueError('render timestamps and padding must be finite')
+        if not values.get('mediaId') and not values.get('sourceUrl'):
+            raise ValueError('mediaId or sourceUrl is required')
+        if start is not None and start > max_source_position_seconds():
+            raise ValueError('start exceeds the configured source-position limit')
+        if end is not None and end > max_source_position_seconds():
+            raise ValueError('end exceeds the configured source-position limit')
+        if start is not None and end is not None and (end - start) > max_clip_seconds():
+            raise ValueError('clip duration exceeds the configured limit')
+        if pad_before is not None and pad_before > max_padding_seconds():
+            raise ValueError('padBefore exceeds the configured limit')
+        if pad_after is not None and pad_after > max_padding_seconds():
+            raise ValueError('padAfter exceeds the configured limit')
+        if all(value is not None for value in (start, end, pad_before, pad_after)):
+            if (end - start + pad_before + pad_after) > (max_clip_seconds() + 2 * max_padding_seconds()):
+                raise ValueError('total render window exceeds the configured limit')
+        return values
 
     class Config:
         allow_population_by_field_name = True
@@ -63,10 +157,41 @@ class ClipResponse(BaseModel):
     errorMessage: Optional[str] = None
     requestPayload: ClipRequest
     lastUpdated: datetime
+    generation: int = 0
+
+
+class MediaRegistrationRequest(BaseModel):
+    mediaId: str = Field(..., alias='mediaId', min_length=1, max_length=192)
+    sourcePath: str = Field(..., alias='sourcePath', min_length=1, max_length=4096)
+    sourceSha256: str = Field(..., alias='sourceSha256', regex=r'^[0-9a-f]{64}$')
+    videoCapable: bool = Field(default=True, alias='videoCapable')
+
+    @validator('mediaId', allow_reuse=True)
+    def validate_media_id(cls, value: str) -> str:  # pylint: disable=no-self-argument
+        if not MEDIA_ID_RE.fullmatch(value):
+            raise ValueError('mediaId has invalid characters')
+        return value
+
+    class Config:
+        allow_population_by_field_name = True
+
+
+class MediaRegistrationResponse(BaseModel):
+    mediaId: str
+    tenantId: str
+    sourceSha256: str
+    videoCapable: bool
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    tenant_id: str
+    user_id: str
 
 
 class BundleClipRequest(BaseModel):
     key: str
+    mediaId: Optional[str] = Field(None, alias='mediaId', min_length=1, max_length=192)
     sourceUrl: Optional[HttpUrl] = Field(None, alias='sourceUrl')
     preferVideo: bool = Field(default=False, alias='preferVideo')
     start: float = Field(..., ge=0)
@@ -79,8 +204,9 @@ class BundleClipRequest(BaseModel):
     contextMode: ContextMode = Field(default='seconds', alias='contextMode')
     padBefore: float = Field(default=5, ge=0, alias='padBefore')
     padAfter: float = Field(default=5, ge=0, alias='padAfter')
+    renderProfile: RenderProfile = Field(default='hq-1080p-v1', alias='renderProfile')
 
-    @validator('end')
+    @validator('end', allow_reuse=True)
     def validate_end(cls, value: float, values: Dict[str, float]) -> float:  # pylint: disable=no-self-argument
         start = values.get('start')
         if start is not None and value <= start:
@@ -128,6 +254,9 @@ class Job:
     download_url: Optional[str] = None
     error_message: Optional[str] = None
     output_path: Optional[Path] = None
+    artifact_sha256: Optional[str] = None
+    artifact_bytes: Optional[int] = None
+    validation: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
@@ -162,6 +291,8 @@ class BundleClip:
 @dataclass
 class BundleJob:
     id: str
+    tenant_id: str
+    requested_by_user_id: str
     scope: Optional[str]
     clips: Dict[str, BundleClip]
     status: ClipStatus = 'queued'
@@ -190,6 +321,18 @@ class ClipServiceConfig(BaseModel):
         default='https://storage.googleapis.com/coverr-public/videos/coverr-sketching-while-sitting-in-a-cafe-7414/1080p.mp4'
     )
     ffmpeg_copy_codec: bool = Field(default=False, alias='ffmpegCopyCodec')
+    production: bool = False
+    database_url: Optional[str] = None
+    auto_migrate: bool = True
+    worker_enabled: bool = True
+    worker_poll_seconds: float = Field(default=1.0, ge=0.1, le=30.0)
+    lease_seconds: int = Field(default=120, ge=15, le=3600)
+    render_timeout_seconds: int = Field(default=1800, ge=30, le=7200)
+    artifact_retention_seconds: int = Field(default=0, ge=0, le=31_536_000)
+    retention_check_seconds: int = Field(default=300, ge=30, le=86_400)
+    max_artifact_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=1024)
+    verify_media_sha256: bool = True
+    media_roots: List[Path] = Field(default_factory=list)
 
 
 class ClipJobStore:
@@ -225,24 +368,95 @@ class BundleJobStore:
     def __init__(self) -> None:
         self._bundles: Dict[str, BundleJob] = {}
 
-    def get(self, bundle_id: str) -> Optional[BundleJob]:
-        return self._bundles.get(bundle_id)
+    def get(self, bundle_id: str, tenant_id: Optional[str] = None) -> Optional[BundleJob]:
+        bundle = self._bundles.get(bundle_id)
+        if bundle is None or (tenant_id is not None and bundle.tenant_id != tenant_id):
+            return None
+        return bundle
 
     def create(self, bundle: BundleJob) -> BundleJob:
         self._bundles[bundle.id] = bundle
         return bundle
 
 
+def _configured_media_roots() -> List[Path]:
+    raw = (os.getenv('CLIP_MEDIA_ROOTS') or '').strip()
+    if not raw:
+        return [Path('/srv/icmfyi/media')] if is_production_environment() else []
+    return [Path(item.strip()) for item in raw.split(',') if item.strip()]
+
+
 config = ClipServiceConfig(
-    dryRun=os.getenv('CLIP_SERVICE_DRY_RUN', 'true').lower() != 'false',
+    dryRun=_env_bool('CLIP_SERVICE_DRY_RUN', True),
     output_directory=Path(os.getenv('CLIP_OUTPUT_DIRECTORY', '/tmp/clip-service/output')),
     sample_stream_url=os.getenv('CLIP_SAMPLE_STREAM_URL'),
-    ffmpegCopyCodec=os.getenv('CLIP_FFMPEG_COPY_CODEC', 'false').lower() == 'true',
+    ffmpegCopyCodec=_env_bool('CLIP_FFMPEG_COPY_CODEC', False),
+    production=is_production_environment(),
+    database_url=(os.getenv('CLIP_DATABASE_URL') or '').strip() or None,
+    auto_migrate=_env_bool('CLIP_AUTO_MIGRATE', True),
+    worker_enabled=_env_bool('CLIP_WORKER_ENABLED', True),
+    worker_poll_seconds=float(os.getenv('CLIP_WORKER_POLL_SECONDS', '1.0')),
+    lease_seconds=_env_int('CLIP_WORKER_LEASE_SECONDS', 120, minimum=15, maximum=3600),
+    render_timeout_seconds=_env_int(
+        'CLIP_RENDER_TIMEOUT_SECONDS', 1800, minimum=30, maximum=7200,
+    ),
+    artifact_retention_seconds=_env_int(
+        'CLIP_ARTIFACT_RETENTION_SECONDS', 0, minimum=0, maximum=31_536_000,
+    ),
+    retention_check_seconds=_env_int(
+        'CLIP_RETENTION_CHECK_SECONDS', 300, minimum=30, maximum=86_400,
+    ),
+    max_artifact_bytes=_env_int(
+        'CLIP_MAX_ARTIFACT_BYTES',
+        2 * 1024 * 1024 * 1024,
+        minimum=1024,
+        maximum=20 * 1024 * 1024 * 1024,
+    ),
+    verify_media_sha256=_env_bool('CLIP_VERIFY_MEDIA_SHA256', is_production_environment()),
+    media_roots=_configured_media_roots(),
 )
-AUTH_TOKEN = os.getenv('CLIP_SERVICE_AUTH_TOKEN') or os.getenv('CLIP_SERVICE_TOKEN')
+AUTH_TOKEN = (
+    os.getenv('INTERNAL_SERVICE_SECRET')
+    or os.getenv('CLIP_SERVICE_AUTH_TOKEN')
+    or os.getenv('CLIP_SERVICE_TOKEN')
+)
+if config.production:
+    if not config.database_url:
+        raise RuntimeError('CLIP_DATABASE_URL is required in production')
+    if not AUTH_TOKEN or len(AUTH_TOKEN) < 32:
+        raise RuntimeError('INTERNAL_SERVICE_SECRET (or CLIP_SERVICE_AUTH_TOKEN) must be at least 32 characters')
+    if config.dry_run:
+        raise RuntimeError('CLIP_SERVICE_DRY_RUN must be false in production')
+    if config.ffmpeg_copy_codec:
+        raise RuntimeError('CLIP_FFMPEG_COPY_CODEC is not permitted in production')
+    if not config.media_roots:
+        raise RuntimeError('CLIP_MEDIA_ROOTS must name at least one canonical media root in production')
+    if not config.verify_media_sha256:
+        raise RuntimeError('CLIP_VERIFY_MEDIA_SHA256 must remain true in production')
+    if not config.output_directory.is_absolute() or config.output_directory == Path('/'):
+        raise RuntimeError('CLIP_OUTPUT_DIRECTORY must be a narrow absolute path in production')
+    if 0 < config.artifact_retention_seconds < 3600:
+        raise RuntimeError('CLIP_ARTIFACT_RETENTION_SECONDS must be zero or at least one hour')
+    for configured_root in config.media_roots:
+        if not configured_root.is_absolute() or configured_root == Path('/'):
+            raise RuntimeError('each CLIP_MEDIA_ROOTS entry must be a narrow absolute path')
+        normalized_root = configured_root.resolve()
+        normalized_output = config.output_directory.resolve()
+        if (
+            normalized_root == normalized_output
+            or normalized_root in normalized_output.parents
+            or normalized_output in normalized_root.parents
+        ):
+            raise RuntimeError('CLIP_MEDIA_ROOTS and CLIP_OUTPUT_DIRECTORY must not overlap')
+
 store = ClipJobStore()
 bundle_store = BundleJobStore()
+repository: Repository = create_repository(config.database_url)
 storage_client: Optional[Any] = None
+worker_task: Optional[asyncio.Task[Any]] = None
+retention_task: Optional[asyncio.Task[Any]] = None
+worker_wakeup: Optional[asyncio.Event] = None
+WORKER_ID = f'{os.getenv("HOSTNAME", "clip")}-{os.getpid()}-{uuid4().hex[:12]}'
 
 app = FastAPI(title='HQ Clip Service', version='0.2.0')
 
@@ -259,6 +473,114 @@ def ensure_output_directory(path: Path) -> None:
 def build_output_path(job_id: str, extension: str = 'mp4') -> Path:
     ensure_output_directory(config.output_directory)
     return config.output_directory / f'{job_id}.{extension}'
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _path_within(path: Path, roots: List[Path]) -> bool:
+    return any(path == root or root in path.parents for root in roots)
+
+
+def resolve_canonical_media_path(source_path: str, expected_sha256: Optional[str] = None) -> Path:
+    candidate = Path(source_path)
+    if not candidate.is_absolute():
+        raise ValueError('canonical media sourcePath must be absolute')
+    resolved = candidate.resolve(strict=True)
+    roots = [root.resolve(strict=True) for root in config.media_roots if root.exists()]
+    if config.production and not roots:
+        raise ValueError('no configured canonical media root is mounted')
+    if roots and not _path_within(resolved, roots):
+        raise ValueError('canonical media sourcePath is outside CLIP_MEDIA_ROOTS')
+    if not resolved.is_file():
+        raise ValueError('canonical media sourcePath must be a regular file')
+    if expected_sha256 and config.verify_media_sha256:
+        actual_sha256 = sha256_file(resolved)
+        if not secrets.compare_digest(actual_sha256, expected_sha256):
+            raise ValueError('canonical media SHA-256 no longer matches its registered identity')
+    return resolved
+
+
+def normalized_request_hash(request: ClipRequest, media_id: Optional[str]) -> str:
+    payload = request.dict(by_alias=True, exclude_none=True)
+    if media_id:
+        payload.pop('sourceUrl', None)
+        payload['mediaId'] = media_id
+    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode('ascii')).hexdigest()
+
+
+def persistent_record_response(record: JobRecord) -> ClipResponse:
+    payload = ClipRequest.parse_obj(record.payload)
+    return ClipResponse(
+        clipId=record.id,
+        status=record.status,  # type: ignore[arg-type]
+        streamUrl=record.stream_url,
+        downloadUrl=record.download_url,
+        errorMessage=record.error_message,
+        requestPayload=payload,
+        lastUpdated=record.updated_at,
+        generation=record.generation,
+    )
+
+
+def _safe_artifact_path(record: JobRecord) -> Path:
+    if not record.output_path:
+        raise HTTPException(status_code=404, detail='Clip not available')
+    try:
+        output_root = config.output_directory.resolve(strict=True)
+        path = Path(record.output_path).resolve(strict=True)
+    except (FileNotFoundError, OSError) as exc:
+        raise HTTPException(status_code=404, detail='Clip not available') from exc
+    if not _path_within(path, [output_root]) or not path.is_file():
+        raise HTTPException(status_code=404, detail='Clip not available')
+    return path
+
+
+def parse_byte_range(range_header: str, file_size: int) -> Optional[Tuple[int, int]]:
+    raw = range_header.strip()
+    if not raw:
+        return None
+    if not raw.startswith('bytes=') or ',' in raw:
+        raise ValueError('only one byte range is supported')
+    value = raw[6:].strip()
+    if '-' not in value:
+        raise ValueError('invalid byte range')
+    start_text, end_text = value.split('-', 1)
+    if not start_text:
+        try:
+            suffix_length = int(end_text)
+        except ValueError as exc:
+            raise ValueError('invalid byte range') from exc
+        if suffix_length <= 0:
+            raise ValueError('invalid byte range')
+        start = max(0, file_size - suffix_length)
+        return start, file_size - 1
+    try:
+        start = int(start_text)
+        end = int(end_text) if end_text else file_size - 1
+    except ValueError as exc:
+        raise ValueError('invalid byte range') from exc
+    if start < 0 or start >= file_size or end < start:
+        raise ValueError('unsatisfiable byte range')
+    return start, min(end, file_size - 1)
+
+
+def iter_file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
+    remaining = end - start + 1
+    with path.open('rb') as handle:
+        handle.seek(start)
+        while remaining > 0:
+            block = handle.read(min(chunk_size, remaining))
+            if not block:
+                break
+            remaining -= len(block)
+            yield block
 
 
 def build_bundle_output_path(bundle_id: str, extension: str = 'zip') -> Path:
@@ -494,7 +816,7 @@ def _download_youtube_thumbnail(video_id: str, workdir: Path) -> Optional[Path]:
     for variant in variants:
         url = f"https://i.ytimg.com/vi/{vid}/{variant}"
         try:
-            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            req = UrlRequest(url, headers={"User-Agent": "Mozilla/5.0"})
             with urlopen(req, timeout=5) as resp:
                 if resp.status != 200:
                     continue
@@ -777,26 +1099,136 @@ def _is_audio_source(path: Path) -> bool:
     return suf in {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".opus"}
 
 
-async def run_ffmpeg_clip(job: Job) -> None:
+async def run_bounded_subprocess(args: List[str], timeout_seconds: int) -> Tuple[int, bytes, bytes]:
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            await process.wait()
+        raise
+    return process.returncode or 0, stdout, stderr
+
+
+async def validate_rendered_artifact(path: Path, expected_duration: float) -> Dict[str, Any]:
+    if not path.is_file():
+        raise RuntimeError('ffmpeg did not publish an artifact candidate')
+    artifact_bytes = path.stat().st_size
+    if artifact_bytes <= 0:
+        raise RuntimeError('ffmpeg produced an empty artifact')
+    if artifact_bytes > config.max_artifact_bytes:
+        raise RuntimeError('rendered artifact exceeds CLIP_MAX_ARTIFACT_BYTES')
+    returncode, stdout, stderr = await run_bounded_subprocess(
+        [
+            'ffprobe',
+            '-v',
+            'error',
+            '-show_entries',
+            'format=duration,format_name:stream=codec_type,codec_name,width,height',
+            '-of',
+            'json',
+            str(path),
+        ],
+        30,
+    )
+    if returncode != 0:
+        detail = stderr.decode('utf-8', errors='replace')[:1000]
+        raise RuntimeError(detail or 'ffprobe rejected the rendered artifact')
+    try:
+        probe = json.loads(stdout.decode('utf-8'))
+        duration = float(probe['format']['duration'])
+        streams = probe.get('streams') or []
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError('ffprobe returned an invalid artifact description') from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError('rendered artifact has no finite positive duration')
+    tolerance = max(2.0, min(10.0, expected_duration * 0.10))
+    if duration > expected_duration + tolerance:
+        raise RuntimeError('rendered artifact duration exceeds the bounded request window')
+    video_streams = [stream for stream in streams if stream.get('codec_type') == 'video']
+    audio_streams = [stream for stream in streams if stream.get('codec_type') == 'audio']
+    if not video_streams:
+        raise RuntimeError('rendered artifact has no video stream')
+    if not audio_streams:
+        raise RuntimeError('rendered artifact has no audio stream')
+    return {
+        'format_name': str(probe['format'].get('format_name') or ''),
+        'duration_seconds': round(duration, 6),
+        'artifact_bytes': artifact_bytes,
+        'video_codec': str(video_streams[0].get('codec_name') or ''),
+        'width': int(video_streams[0].get('width') or 0),
+        'height': int(video_streams[0].get('height') or 0),
+        'audio_codec': str(audio_streams[0].get('codec_name') or ''),
+        'render_profile': 'hq-1080p-v1',
+    }
+
+
+def publish_artifact_atomically(staged_path: Path, job_id: str, artifact_sha256: str) -> Path:
+    artifact_directory = config.output_directory / 'artifacts' / job_id
+    artifact_directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+    final_path = artifact_directory / f'{artifact_sha256}.mp4'
+    with staged_path.open('rb') as handle:
+        os.fsync(handle.fileno())
+    if final_path.exists():
+        if sha256_file(final_path) != artifact_sha256:
+            raise RuntimeError('existing immutable artifact path has unexpected bytes')
+        staged_path.unlink()
+    else:
+        os.replace(staged_path, final_path)
+        final_path.chmod(0o640)
+    directory_fd = os.open(str(artifact_directory), os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return final_path
+
+
+async def run_ffmpeg_clip(
+    job: Job,
+    *,
+    source_override: Optional[Path] = None,
+    raise_errors: bool = False,
+) -> None:
     job.status = 'processing'
-    job.updated_at = datetime.utcnow()
+    job.updated_at = datetime.now(timezone.utc)
 
     if config.dry_run:
-        await asyncio.sleep(2.5)
+        await asyncio.sleep(0)
         job.stream_url = config.sample_stream_url
         job.download_url = config.sample_stream_url
+        marker = (config.sample_stream_url or 'dry-run').encode('utf-8')
+        job.output_path = None
+        job.artifact_sha256 = hashlib.sha256(marker).hexdigest()
+        job.artifact_bytes = len(marker)
+        job.validation = {'dry_run': True, 'render_profile': job.payload.renderProfile}
         job.status = 'ready'
-        job.updated_at = datetime.utcnow()
+        job.updated_at = datetime.now(timezone.utc)
         return
 
+    staged_path: Optional[Path] = None
     try:
         with tempfile.TemporaryDirectory(prefix=f'clip-job-{job.id}-') as tmp:
             workdir = Path(tmp)
-            source_path = await fetch_source(job.payload, workdir)
+            source_path = source_override or await fetch_source(job.payload, workdir)
             if not source_path.exists():
                 raise FileNotFoundError('Downloaded source not found')
 
-            output_path = build_output_path(job.id)
+            staging_directory = config.output_directory / '.staging'
+            staging_directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+            staged_path = staging_directory / f'{job.id}-{uuid4().hex}.mp4'
+            output_path = staged_path
 
             effective_pad_before = job.payload.padBefore
             effective_pad_after = job.payload.padAfter
@@ -836,11 +1268,13 @@ async def run_ffmpeg_clip(job: Job) -> None:
                         "-tune",
                         "stillimage",
                         "-preset",
-                        "veryfast",
+                        "medium",
                         "-pix_fmt",
                         "yuv420p",
                         "-c:a",
                         "aac",
+                        "-b:a",
+                        "192k",
                         "-shortest",
                         "-movflags",
                         "+faststart",
@@ -866,11 +1300,13 @@ async def run_ffmpeg_clip(job: Job) -> None:
                         "-tune",
                         "stillimage",
                         "-preset",
-                        "veryfast",
+                        "medium",
                         "-pix_fmt",
                         "yuv420p",
                         "-c:a",
                         "aac",
+                        "-b:a",
+                        "192k",
                         "-shortest",
                         "-movflags",
                         "+faststart",
@@ -897,9 +1333,17 @@ async def run_ffmpeg_clip(job: Job) -> None:
                         "-c:v",
                         "libx264",
                         "-preset",
-                        "veryfast",
+                        "medium",
+                        "-crf",
+                        "18",
+                        "-vf",
+                        "scale='min(1920,iw)':-2",
+                        "-pix_fmt",
+                        "yuv420p",
                         "-c:a",
                         "aac",
+                        "-b:a",
+                        "192k",
                         "-movflags",
                         "+faststart",
                         str(output_path),
@@ -922,22 +1366,25 @@ async def run_ffmpeg_clip(job: Job) -> None:
                         "-c:v",
                         "libx264",
                         "-preset",
-                        "veryfast",
+                        "medium",
+                        "-crf",
+                        "18",
+                        "-vf",
+                        "scale='min(1920,iw)':-2",
+                        "-pix_fmt",
+                        "yuv420p",
                         "-c:a",
                         "aac",
+                        "-b:a",
+                        "192k",
                         "-movflags",
                         "+faststart",
                         str(output_path),
                     ]
 
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
+            returncode, _, stderr = await run_bounded_subprocess(args, config.render_timeout_seconds)
 
-            if proc.returncode != 0:
+            if returncode != 0:
                 stderr_text = stderr.decode('utf-8', errors='ignore') if stderr else ''
                 if fallback_args:
                     try:
@@ -946,27 +1393,40 @@ async def run_ffmpeg_clip(job: Job) -> None:
                     except Exception:
                         pass
                     print('[clip-service] ffmpeg copy cut failed; retrying with transcode', flush=True)
-                    proc = await asyncio.create_subprocess_exec(
-                        *fallback_args,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
+                    returncode, _, stderr = await run_bounded_subprocess(
+                        fallback_args,
+                        config.render_timeout_seconds,
                     )
-                    _, stderr = await proc.communicate()
-                    if proc.returncode != 0:
+                    if returncode != 0:
                         stderr_text = stderr.decode('utf-8', errors='ignore') if stderr else ''
                         raise RuntimeError(stderr_text or 'ffmpeg exited with non-zero status')
                 else:
                     raise RuntimeError(stderr_text or 'ffmpeg exited with non-zero status')
 
-            job.output_path = output_path
+            validation = await validate_rendered_artifact(output_path, duration)
+            artifact_sha256 = await asyncio.to_thread(sha256_file, output_path)
+            artifact_bytes = output_path.stat().st_size
+            final_path = await asyncio.to_thread(publish_artifact_atomically, output_path, job.id, artifact_sha256)
+            staged_path = None
+            job.output_path = final_path
+            job.artifact_sha256 = artifact_sha256
+            job.artifact_bytes = artifact_bytes
+            job.validation = validation
             job.stream_url = f'/clips/{job.id}/file'
             job.download_url = f'/clips/{job.id}/file?download=1'
             job.status = 'ready'
-        job.updated_at = datetime.utcnow()
+        job.updated_at = datetime.now(timezone.utc)
     except Exception as exc:  # pylint: disable=broad-except
+        if staged_path is not None:
+            try:
+                staged_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         job.status = 'error'
-        job.error_message = str(exc)
-        job.updated_at = datetime.utcnow()
+        job.error_message = str(exc)[:2000]
+        job.updated_at = datetime.now(timezone.utc)
+        if raise_errors:
+            raise
 
 
 def create_bundle_archive(bundle: BundleJob) -> Path:
@@ -989,6 +1449,7 @@ async def process_job(job: Job) -> None:
 
 def clip_request_from_bundle(clip: BundleClipRequest) -> ClipRequest:
     payload = ClipRequest(
+        mediaId=clip.mediaId,
         sourceUrl=clip.sourceUrl,
         parentTitle=clip.parentTitle,
         clipLabel=clip.clipLabel,
@@ -999,6 +1460,7 @@ def clip_request_from_bundle(clip: BundleClipRequest) -> ClipRequest:
         contextMode=clip.contextMode,
         padBefore=clip.padBefore,
         padAfter=clip.padAfter,
+        renderProfile=clip.renderProfile,
     )
     return payload
 
@@ -1039,61 +1501,438 @@ async def process_bundle_job(bundle: BundleJob) -> None:
     bundle.updated_at = datetime.utcnow()
 
 
-def verify_auth_header(authorization: str = Header(default='')) -> None:
-    if not AUTH_TOKEN:
+async def _lease_heartbeat(job_id: str, stop: asyncio.Event, lease_lost: asyncio.Event) -> None:
+    interval = max(5.0, config.lease_seconds / 3.0)
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            renewed = await asyncio.to_thread(
+                repository.heartbeat,
+                job_id,
+                WORKER_ID,
+                config.lease_seconds,
+            )
+            if not renewed:
+                lease_lost.set()
+                return
+
+
+async def process_claimed_record(record: JobRecord) -> None:
+    stop_heartbeat = asyncio.Event()
+    lease_lost = asyncio.Event()
+    heartbeat_task = asyncio.create_task(_lease_heartbeat(record.id, stop_heartbeat, lease_lost))
+    try:
+        payload = ClipRequest.parse_obj(record.payload)
+        source_override: Optional[Path] = None
+        if record.media_id:
+            media = await asyncio.to_thread(repository.resolve_media, record.tenant_id, record.media_id)
+            if (config.production or payload.preferVideo) and not media.video_capable:
+                raise ValueError('canonical media is not clip-ready video')
+            source_override = await asyncio.to_thread(
+                resolve_canonical_media_path,
+                media.source_path,
+                media.source_sha256,
+            )
+        elif config.production:
+            raise ValueError('production clip jobs require canonical mediaId')
+
+        job = Job(id=record.id, payload=payload)
+        await run_ffmpeg_clip(job, source_override=source_override, raise_errors=True)
+        if lease_lost.is_set():
+            raise LeaseLost('worker lease expired during rendering')
+        output_path = str(job.output_path) if job.output_path else (job.stream_url or 'dry-run')
+        await asyncio.to_thread(
+            repository.mark_ready,
+            record.id,
+            WORKER_ID,
+            stream_url=job.stream_url or f'/clips/{record.id}/file',
+            download_url=job.download_url or f'/clips/{record.id}/file?download=1',
+            output_path=output_path,
+            artifact_sha256=job.artifact_sha256 or hashlib.sha256(output_path.encode('utf-8')).hexdigest(),
+            artifact_bytes=job.artifact_bytes or max(1, len(output_path.encode('utf-8'))),
+            validation=job.validation,
+        )
+    except LeaseLost:
         return
-    if not authorization or not authorization.startswith('Bearer '):
-        raise HTTPException(status_code=401, detail='Missing bearer token')
-    token = authorization[7:].strip()
-    if not token or not secrets.compare_digest(token, AUTH_TOKEN):
-        raise HTTPException(status_code=401, detail='Invalid bearer token')
+    except Exception as exc:  # pylint: disable=broad-except
+        retryable = not isinstance(exc, (FileNotFoundError, MediaNotFound, ValueError))
+        delay = min(300, 5 * (2 ** max(0, record.attempt_count - 1)))
+        error_message = 'clip render failed' if config.production else str(exc)
+        print(
+            f'[clip-service] render_failed job_id={record.id} '
+            f'error_type={type(exc).__name__} retryable={str(retryable).lower()}',
+            flush=True,
+        )
+        try:
+            await asyncio.to_thread(
+                repository.mark_failure,
+                record.id,
+                WORKER_ID,
+                error_code='render_failed',
+                error_message=error_message,
+                retryable=retryable,
+                retry_delay_seconds=delay,
+            )
+        except LeaseLost:
+            return
+    finally:
+        stop_heartbeat.set()
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+
+async def process_persistent_job(job_id: str) -> None:
+    record = await asyncio.to_thread(repository.claim, job_id, WORKER_ID, config.lease_seconds)
+    if record is not None:
+        await process_claimed_record(record)
+
+
+async def persistent_worker_loop() -> None:
+    assert worker_wakeup is not None
+    while True:
+        try:
+            record = await asyncio.to_thread(repository.claim_next, WORKER_ID, config.lease_seconds)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(
+                f'[clip-service] worker_poll_failed error_type={type(exc).__name__}',
+                flush=True,
+            )
+            await asyncio.sleep(config.worker_poll_seconds)
+            continue
+        if record is not None:
+            await process_claimed_record(record)
+            continue
+        worker_wakeup.clear()
+        try:
+            await asyncio.wait_for(worker_wakeup.wait(), timeout=config.worker_poll_seconds)
+        except asyncio.TimeoutError:
+            pass
+
+
+def delete_expired_artifact(path_value: str) -> bool:
+    try:
+        output_root = config.output_directory.resolve(strict=True)
+        artifact_path = Path(path_value).resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return False
+    if not _path_within(artifact_path, [output_root]) or not artifact_path.is_file():
+        return False
+    artifact_path.unlink()
+    return True
+
+
+async def run_retention_cleanup_once() -> Tuple[int, int]:
+    if config.artifact_retention_seconds <= 0:
+        return 0, 0
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=config.artifact_retention_seconds)
+    expired_paths = await asyncio.to_thread(repository.expire_ready_before, cutoff, 1000)
+    deleted = 0
+    for path_value in expired_paths:
+        try:
+            deleted += int(await asyncio.to_thread(delete_expired_artifact, path_value))
+        except OSError as exc:
+            print(
+                f'[clip-service] retention_unlink_failed error_type={type(exc).__name__}',
+                flush=True,
+            )
+    if expired_paths:
+        print(
+            f'[clip-service] retention_complete expired={len(expired_paths)} deleted={deleted}',
+            flush=True,
+        )
+    return len(expired_paths), deleted
+
+
+async def retention_cleanup_loop() -> None:
+    while True:
+        await asyncio.sleep(config.retention_check_seconds)
+        try:
+            await run_retention_cleanup_once()
+        except Exception as exc:  # pylint: disable=broad-except
+            print(
+                f'[clip-service] retention_failed error_type={type(exc).__name__}',
+                flush=True,
+            )
+
+
+@app.on_event('startup')
+async def startup_service() -> None:
+    global retention_task, worker_task, worker_wakeup  # pylint: disable=global-statement
+    ensure_output_directory(config.output_directory)
+    if config.auto_migrate:
+        await asyncio.to_thread(repository.ensure_schema)
+    worker_wakeup = asyncio.Event()
+    if config.worker_enabled:
+        worker_task = asyncio.create_task(persistent_worker_loop())
+    if config.artifact_retention_seconds > 0:
+        retention_task = asyncio.create_task(retention_cleanup_loop())
+
+
+@app.on_event('shutdown')
+async def shutdown_service() -> None:
+    global retention_task, worker_task  # pylint: disable=global-statement
+    if worker_task is not None:
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+        worker_task = None
+    if retention_task is not None:
+        retention_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await retention_task
+        retention_task = None
+
+
+def _validate_identity(value: str, pattern: re.Pattern[str], label: str) -> str:
+    normalized = value.strip()
+    if not pattern.fullmatch(normalized):
+        raise HTTPException(status_code=400, detail=f'Invalid {label} header')
+    return normalized
+
+
+def require_request_context(
+    authorization: str = Header(default=''),
+    internal_secret: str = Header(default='', alias='x-icmfyi-internal-secret'),
+    tenant_id: str = Header(default='', alias='x-icmfyi-tenant-id'),
+    user_id: str = Header(default='', alias='x-icmfyi-user-id'),
+) -> RequestContext:
+    if config.production:
+        if not internal_secret:
+            raise HTTPException(status_code=401, detail='Missing internal service secret')
+        if not AUTH_TOKEN or not secrets.compare_digest(internal_secret, AUTH_TOKEN):
+            raise HTTPException(status_code=401, detail='Invalid internal service secret')
+        if not tenant_id:
+            raise HTTPException(status_code=400, detail='Missing x-icmfyi-tenant-id header')
+        if not user_id:
+            raise HTTPException(status_code=400, detail='Missing x-icmfyi-user-id header')
+    elif AUTH_TOKEN:
+        supplied = internal_secret
+        if not supplied and authorization.startswith('Bearer '):
+            supplied = authorization[7:].strip()
+        if not supplied:
+            raise HTTPException(status_code=401, detail='Missing bearer token')
+        if not secrets.compare_digest(supplied, AUTH_TOKEN):
+            raise HTTPException(status_code=401, detail='Invalid bearer token')
+
+    effective_tenant = tenant_id or 'local'
+    effective_user = user_id or 'local'
+    tenant_pattern = PRODUCTION_TENANT_ID_RE if config.production else TENANT_ID_RE
+    user_pattern = PRODUCTION_USER_ID_RE if config.production else USER_ID_RE
+    return RequestContext(
+        tenant_id=_validate_identity(effective_tenant, tenant_pattern, 'tenant'),
+        user_id=_validate_identity(effective_user, user_pattern, 'user'),
+    )
+
+
+def validate_idempotency_key(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > 200 or any(ord(char) < 33 or ord(char) > 126 for char in normalized):
+        raise HTTPException(status_code=400, detail='Invalid Idempotency-Key header')
+    return normalized
 
 
 @app.get('/healthz')
-async def healthcheck() -> Dict[str, bool]:
-    return {'status': True, 'dry_run': config.dry_run}
+async def healthcheck() -> Dict[str, Any]:
+    return {
+        'status': True,
+        'dry_run': config.dry_run,
+        'production': config.production,
+        'durable': repository.durable,
+        'worker_enabled': config.worker_enabled,
+        'retention_enabled': config.artifact_retention_seconds > 0,
+    }
+
+
+@app.get('/readyz')
+async def readinesscheck() -> Dict[str, bool]:
+    try:
+        await asyncio.to_thread(repository.get_for_tenant, '__readiness__', '__readiness__')
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=503, detail='Clip persistence unavailable') from exc
+    return {'status': True, 'persistence': True}
+
+
+@app.post(
+    '/internal/media',
+    response_model=MediaRegistrationResponse,
+    include_in_schema=not config.production,
+)
+async def register_canonical_media(
+    request: MediaRegistrationRequest,
+    context: RequestContext = Depends(require_request_context),
+) -> MediaRegistrationResponse:
+    if config.production:
+        raise HTTPException(status_code=404, detail='Not found')
+    try:
+        resolved = await asyncio.to_thread(
+            resolve_canonical_media_path,
+            request.sourcePath,
+            request.sourceSha256,
+        )
+        media = MediaRecord(
+            media_id=request.mediaId,
+            source_path=str(resolved),
+            source_sha256=request.sourceSha256,
+            video_capable=request.videoCapable,
+        )
+        await asyncio.to_thread(repository.register_media, media, [context.tenant_id])
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except MediaConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return MediaRegistrationResponse(
+        mediaId=request.mediaId,
+        tenantId=context.tenant_id,
+        sourceSha256=request.sourceSha256,
+        videoCapable=request.videoCapable,
+    )
 
 
 @app.post('/clips', response_model=ClipResponse)
 async def create_clip(
     request: ClipRequest,
     background_tasks: BackgroundTasks,
-    _: None = Depends(verify_auth_header),
+    idempotency_key: Optional[str] = Header(default=None, alias='Idempotency-Key'),
+    context: RequestContext = Depends(require_request_context),
 ) -> ClipResponse:
-    existing = store.find_existing(request)
-    if existing:
-        return existing.to_response()
+    if config.production and (not request.mediaId or request.sourceUrl is not None):
+        raise HTTPException(
+            status_code=400,
+            detail='Production clip requests require mediaId and do not accept sourceUrl',
+        )
+    if request.mediaId:
+        try:
+            media = await asyncio.to_thread(repository.resolve_media, context.tenant_id, request.mediaId)
+        except MediaNotFound as exc:
+            raise HTTPException(status_code=404, detail='Canonical media not found') from exc
+        if (config.production or request.preferVideo) and not media.video_capable:
+            raise HTTPException(status_code=400, detail='Canonical media is not clip-ready video')
 
-    job = Job(id=uuid4().hex, payload=request)
-    store.create(job)
+    key = validate_idempotency_key(idempotency_key)
+    request_hash = normalized_request_hash(request, request.mediaId)
+    record = new_job_record(
+        id=uuid4().hex,
+        tenant_id=context.tenant_id,
+        requested_by_user_id=context.user_id,
+        media_id=request.mediaId,
+        request_hash=request_hash,
+        idempotency_key=key,
+        payload=request.dict(by_alias=True, exclude_none=True),
+        render_profile=request.renderProfile,
+        status='queued',
+    )
+    try:
+        persisted, created = await asyncio.to_thread(repository.create_or_get, record)
+    except IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail='Clip persistence unavailable') from exc
+    if created:
+        if worker_wakeup is not None:
+            worker_wakeup.set()
+        if not config.production:
+            background_tasks.add_task(process_persistent_job, persisted.id)
+    return persistent_record_response(persisted)
 
-    background_tasks.add_task(process_job, job)
-    return job.to_response()
+
+@app.post('/clips/{clip_id}/retry', response_model=ClipResponse)
+async def retry_clip(
+    clip_id: str,
+    background_tasks: BackgroundTasks,
+    idempotency_key: Optional[str] = Header(default=None, alias='Idempotency-Key'),
+    context: RequestContext = Depends(require_request_context),
+) -> ClipResponse:
+    key = validate_idempotency_key(idempotency_key)
+    if key is None:
+        raise HTTPException(status_code=400, detail='Idempotency-Key is required for clip retry')
+    try:
+        persisted, created = await asyncio.to_thread(
+            repository.retry_terminal,
+            clip_id,
+            context.tenant_id,
+            context.user_id,
+            key,
+            uuid4().hex,
+        )
+    except MediaNotFound as exc:
+        raise HTTPException(status_code=404, detail='Clip not found') from exc
+    except (IdempotencyConflict, RetryNotAllowed) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail='Clip persistence unavailable') from exc
+    if created:
+        if worker_wakeup is not None:
+            worker_wakeup.set()
+        if not config.production:
+            background_tasks.add_task(process_persistent_job, persisted.id)
+    return persistent_record_response(persisted)
 
 
 @app.get('/clips/{clip_id}', response_model=ClipResponse)
-async def get_clip(clip_id: str, _: None = Depends(verify_auth_header)) -> ClipResponse:
-    job = store.get(clip_id)
-    if not job:
+async def get_clip(
+    clip_id: str,
+    context: RequestContext = Depends(require_request_context),
+) -> ClipResponse:
+    record = await asyncio.to_thread(repository.get_for_tenant, clip_id, context.tenant_id)
+    if not record:
         raise HTTPException(status_code=404, detail='Clip not found')
-    return job.to_response()
+    return persistent_record_response(record)
 
 
 @app.get('/clips/{clip_id}/file')
 async def serve_clip_file(
     clip_id: str,
+    http_request: Request,
     download: bool = Query(False),
-    _: None = Depends(verify_auth_header),
-) -> FileResponse:
-    job = store.get(clip_id)
-    if not job or job.status != 'ready' or not job.output_path or not job.output_path.exists():
+    context: RequestContext = Depends(require_request_context),
+) -> Any:
+    record = await asyncio.to_thread(repository.get_for_tenant, clip_id, context.tenant_id)
+    if not record or record.status != 'ready':
         raise HTTPException(status_code=404, detail='Clip not available')
+    output_path = _safe_artifact_path(record)
 
-    filename = job.output_path.name if download else None
+    filename = output_path.name if download else None
+    artifact_bytes = output_path.stat().st_size
+    etag_value = output_path.stem if re.fullmatch(r'[0-9a-f]{64}', output_path.stem) else sha256_file(output_path)
+    etag = f'"{etag_value}"'
+    response_headers = {'Accept-Ranges': 'bytes', 'ETag': etag}
+    if download:
+        response_headers['Content-Disposition'] = f'attachment; filename="{output_path.name}"'
+
+    range_header = http_request.headers.get('range', '')
+    if_range = http_request.headers.get('if-range', '')
+    if range_header and (not if_range or secrets.compare_digest(if_range.strip(), etag)):
+        try:
+            parsed_range = parse_byte_range(range_header, artifact_bytes)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=416,
+                detail=str(exc),
+                headers={'Content-Range': f'bytes */{artifact_bytes}', 'Accept-Ranges': 'bytes'},
+            ) from exc
+        assert parsed_range is not None
+        start, end = parsed_range
+        response_headers.update({
+            'Content-Range': f'bytes {start}-{end}/{artifact_bytes}',
+            'Content-Length': str(end - start + 1),
+        })
+        return StreamingResponse(
+            iter_file_range(output_path, start, end),
+            status_code=206,
+            media_type='video/mp4',
+            headers=response_headers,
+        )
+
     return FileResponse(
-        job.output_path,
+        output_path,
         media_type='video/mp4',
         filename=filename,
+        headers=response_headers,
     )
 
 
@@ -1105,7 +1944,7 @@ def ensure_unique_keys(clips: List[BundleClipRequest]) -> None:
         seen.add(clip.key)
 
 
-def build_bundle(bundle_request: BundleRequest) -> BundleJob:
+def build_bundle(bundle_request: BundleRequest, context: RequestContext) -> BundleJob:
     ensure_unique_keys(bundle_request.clips)
     clips: Dict[str, BundleClip] = {}
     for clip_req in bundle_request.clips:
@@ -1113,7 +1952,13 @@ def build_bundle(bundle_request: BundleRequest) -> BundleJob:
         job = Job(id=uuid4().hex, payload=payload)
         store.create(job)
         clips[clip_req.key] = BundleClip(key=clip_req.key, job=job)
-    bundle = BundleJob(id=uuid4().hex, scope=bundle_request.scope, clips=clips)
+    bundle = BundleJob(
+        id=uuid4().hex,
+        tenant_id=context.tenant_id,
+        requested_by_user_id=context.user_id,
+        scope=bundle_request.scope,
+        clips=clips,
+    )
     bundle_store.create(bundle)
     return bundle
 
@@ -1122,11 +1967,13 @@ def build_bundle(bundle_request: BundleRequest) -> BundleJob:
 async def create_bundle(
     request: BundleRequest,
     background_tasks: BackgroundTasks,
-    _: None = Depends(verify_auth_header),
+    context: RequestContext = Depends(require_request_context),
 ) -> BundleResponse:
+    if config.production:
+        raise HTTPException(status_code=503, detail='Durable batch clips are not enabled in production')
     if not request.clips:
         raise HTTPException(status_code=400, detail='At least one clip is required.')
-    bundle = build_bundle(request)
+    bundle = build_bundle(request, context)
     background_tasks.add_task(process_bundle_job, bundle)
     return bundle.to_response()
 
@@ -1134,9 +1981,11 @@ async def create_bundle(
 @app.get('/clips/batch/{batch_id}', response_model=BundleResponse)
 async def get_bundle(
     batch_id: str,
-    _: None = Depends(verify_auth_header),
+    context: RequestContext = Depends(require_request_context),
 ) -> BundleResponse:
-    bundle = bundle_store.get(batch_id)
+    if config.production:
+        raise HTTPException(status_code=503, detail='Durable batch clips are not enabled in production')
+    bundle = bundle_store.get(batch_id, context.tenant_id)
     if not bundle:
         raise HTTPException(status_code=404, detail='Bundle not found')
     return bundle.to_response()
@@ -1146,9 +1995,11 @@ async def get_bundle(
 async def serve_bundle_file(
     batch_id: str,
     download: bool = Query(True),
-    _: None = Depends(verify_auth_header),
+    context: RequestContext = Depends(require_request_context),
 ) -> FileResponse:
-    bundle = bundle_store.get(batch_id)
+    if config.production:
+        raise HTTPException(status_code=503, detail='Durable batch clips are not enabled in production')
+    bundle = bundle_store.get(batch_id, context.tenant_id)
     if not bundle or bundle.status != 'ready':
         raise HTTPException(status_code=404, detail='Bundle is not ready')
 
@@ -1167,9 +2018,11 @@ async def serve_bundle_file(
 async def retry_bundle_clip(
     batch_id: str,
     payload: Dict[str, str] = Body(...),
-    _: None = Depends(verify_auth_header),
+    context: RequestContext = Depends(require_request_context),
 ) -> BundleResponse:
-    bundle = bundle_store.get(batch_id)
+    if config.production:
+        raise HTTPException(status_code=503, detail='Durable batch clips are not enabled in production')
+    bundle = bundle_store.get(batch_id, context.tenant_id)
     if not bundle:
         raise HTTPException(status_code=404, detail='Bundle not found')
 

@@ -1,0 +1,265 @@
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from persistence import (
+    IdempotencyConflict,
+    JobRecord,
+    LeaseLost,
+    MediaConflict,
+    MediaNotFound,
+    MediaRecord,
+    MemoryRepository,
+    PostgresRepository,
+    RetryNotAllowed,
+)
+
+
+def record(**overrides):
+    values = {
+        'id': 'job-1',
+        'tenant_id': 'tenant-a',
+        'requested_by_user_id': 'user-a',
+        'media_id': 'media-1',
+        'request_hash': '1' * 64,
+        'idempotency_key': 'request-1',
+        'payload': {'mediaId': 'media-1'},
+        'render_profile': 'hq-1080p-v1',
+        'status': 'queued',
+    }
+    values.update(overrides)
+    return JobRecord(**values)
+
+
+def test_job_record_timestamp_defaults_are_real_utc_datetimes():
+    created = record()
+
+    assert isinstance(created.available_at, datetime)
+    assert isinstance(created.created_at, datetime)
+    assert isinstance(created.updated_at, datetime)
+    assert created.available_at.tzinfo == timezone.utc
+
+
+def test_canonical_media_is_immutable_and_tenant_scoped():
+    repository = MemoryRepository()
+    media = MediaRecord('media-1', '/media/source.mp4', 'a' * 64, True)
+    repository.register_media(media, ['tenant-a'])
+
+    assert repository.resolve_media('tenant-a', 'media-1') == media
+    with pytest.raises(MediaNotFound):
+        repository.resolve_media('tenant-b', 'media-1')
+    with pytest.raises(MediaConflict):
+        repository.register_media(
+            MediaRecord('media-1', '/media/replaced.mp4', 'b' * 64, True),
+            ['tenant-a'],
+        )
+
+
+def test_postgres_media_resolver_sets_transaction_local_rls_scope_first(monkeypatch):
+    calls = []
+
+    class Result:
+        def fetchone(self):
+            return {
+                'media_id': 'media-1',
+                'source_path': '/media/source.mp4',
+                'source_sha256': 'a' * 64,
+                'video_capable': True,
+            }
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, params=None):
+            calls.append((' '.join(query.split()), params))
+            return Result()
+
+    repository = PostgresRepository('postgresql://runtime:secret@postgres/icmfyi')
+    monkeypatch.setattr(repository, '_connect', lambda: Connection())
+
+    media = repository.resolve_media('ten_' + 'b' * 64, 'media-1')
+
+    assert "set_config('app.tenant_id'" in calls[0][0]
+    assert calls[0][1] == ('ten_' + 'b' * 64,)
+    assert 'tenant_channel_entitlements' in calls[1][0]
+    assert calls[1][1] == ('ten_' + 'b' * 64, 'media-1')
+    assert media.media_id == 'media-1'
+
+
+def test_idempotency_conflict_is_user_scoped_while_request_dedupe_is_tenant_scoped():
+    repository = MemoryRepository()
+    first, created = repository.create_or_get(record())
+    assert created is True
+
+    duplicate, created = repository.create_or_get(record(id='job-2'))
+    assert created is False
+    assert duplicate.id == first.id
+
+    with pytest.raises(IdempotencyConflict):
+        repository.create_or_get(record(id='job-3', request_hash='2' * 64))
+
+    other_user, created = repository.create_or_get(
+        record(
+            id='job-4',
+            requested_by_user_id='user-b',
+            request_hash='3' * 64,
+        )
+    )
+    assert created is True
+    assert other_user.id == 'job-4'
+
+    alias, created = repository.create_or_get(
+        record(id='job-5', idempotency_key='request-alias')
+    )
+    assert created is False
+    assert alias.id == first.id
+    with pytest.raises(IdempotencyConflict):
+        repository.create_or_get(
+            record(id='job-6', request_hash='4' * 64, idempotency_key='request-alias')
+        )
+
+
+def test_expired_lease_cannot_publish_and_last_attempt_becomes_terminal():
+    repository = MemoryRepository()
+    repository.create_or_get(record(max_attempts=1))
+    claimed = repository.claim('job-1', 'worker-a', 30)
+    assert claimed is not None
+    repository._jobs['job-1'] = replace(  # pylint: disable=protected-access
+        claimed,
+        lease_until=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+
+    with pytest.raises(LeaseLost):
+        repository.mark_ready(
+            'job-1',
+            'worker-a',
+            stream_url='/clips/job-1/file',
+            download_url='/clips/job-1/file?download=1',
+            output_path='/output/job-1.mp4',
+            artifact_sha256='f' * 64,
+            artifact_bytes=10,
+            validation={},
+        )
+
+    assert repository.claim('job-1', 'worker-b', 30) is None
+    exhausted = repository.get_for_tenant('job-1', 'tenant-a')
+    assert exhausted is not None
+    assert exhausted.status == 'error'
+    assert exhausted.error_code == 'attempts_exhausted'
+
+
+def test_ready_artifact_and_job_transition_publish_together():
+    repository = MemoryRepository()
+    repository.create_or_get(record())
+    claimed = repository.claim('job-1', 'worker-a', 30)
+    assert claimed is not None
+
+    ready = repository.mark_ready(
+        'job-1',
+        'worker-a',
+        stream_url='/clips/job-1/file',
+        download_url='/clips/job-1/file?download=1',
+        output_path='/output/job-1.mp4',
+        artifact_sha256='f' * 64,
+        artifact_bytes=10,
+        validation={'duration_seconds': 1.0},
+    )
+
+    assert ready.status == 'ready'
+    assert repository._artifacts['job-1']['sha256'] == 'f' * 64  # pylint: disable=protected-access
+    with pytest.raises(LeaseLost):
+        repository.mark_failure(
+            'job-1',
+            'worker-a',
+            error_code='late',
+            error_message='late worker',
+            retryable=False,
+            retry_delay_seconds=0,
+        )
+
+
+def test_retention_expires_ready_job_and_detaches_artifact_atomically():
+    repository = MemoryRepository()
+    repository.create_or_get(record())
+    assert repository.claim('job-1', 'worker-a', 30) is not None
+    ready = repository.mark_ready(
+        'job-1',
+        'worker-a',
+        stream_url='/clips/job-1/file',
+        download_url='/clips/job-1/file?download=1',
+        output_path='/output/job-1.mp4',
+        artifact_sha256='f' * 64,
+        artifact_bytes=10,
+        validation={'duration_seconds': 1.0},
+    )
+    repository._jobs['job-1'] = replace(  # pylint: disable=protected-access
+        ready,
+        updated_at=datetime.now(timezone.utc) - timedelta(days=2),
+    )
+
+    paths = repository.expire_ready_before(
+        datetime.now(timezone.utc) - timedelta(days=1),
+        100,
+    )
+
+    assert paths == ['/output/job-1.mp4']
+    expired = repository.get_for_tenant('job-1', 'tenant-a')
+    assert expired is not None
+    assert expired.status == 'expired'
+    assert expired.stream_url is None
+    assert expired.download_url is None
+    assert expired.output_path is None
+    assert expired.error_code == 'artifact_expired'
+    assert 'job-1' not in repository._artifacts  # pylint: disable=protected-access
+    assert repository.expire_ready_before(datetime.now(timezone.utc), 100) == []
+
+
+def test_terminal_retry_creates_one_new_generation_and_duplicate_intents_converge():
+    repository = MemoryRepository()
+    repository.create_or_get(record(idempotency_key='create-1'))
+    claimed = repository.claim('job-1', 'worker-a', 30)
+    assert claimed is not None
+    failed = repository.mark_failure(
+        'job-1',
+        'worker-a',
+        error_code='render_failed',
+        error_message='bounded failure',
+        retryable=False,
+        retry_delay_seconds=0,
+    )
+    assert failed.status == 'error'
+
+    retried, created = repository.retry_terminal(
+        'job-1', 'tenant-a', 'user-a', 'retry-1', 'job-2',
+    )
+    assert created is True
+    assert retried.id == 'job-2'
+    assert retried.generation == 1
+    assert retried.payload == failed.payload
+
+    duplicate, created = repository.retry_terminal(
+        'job-1', 'tenant-a', 'user-a', 'retry-1', 'job-3',
+    )
+    assert created is False
+    assert duplicate.id == 'job-2'
+
+    concurrent_alias, created = repository.retry_terminal(
+        'job-1', 'tenant-a', 'user-a', 'retry-2', 'job-4',
+    )
+    assert created is False
+    assert concurrent_alias.id == 'job-2'
+    assert len(repository._jobs) == 2  # pylint: disable=protected-access
+
+
+def test_nonterminal_or_cross_tenant_retry_is_rejected():
+    repository = MemoryRepository()
+    repository.create_or_get(record())
+    with pytest.raises(RetryNotAllowed):
+        repository.retry_terminal('job-1', 'tenant-a', 'user-a', 'retry-1', 'job-2')
+    with pytest.raises(MediaNotFound):
+        repository.retry_terminal('job-1', 'tenant-b', 'user-b', 'retry-2', 'job-3')
